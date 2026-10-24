@@ -1,0 +1,332 @@
+import datetime
+import os
+import re
+from pathlib import Path
+from typing import List, Optional
+
+import docx
+from docx import Document
+from docx.enum.table import WD_TABLE_ALIGNMENT
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml import OxmlElement, parse_xml
+from docx.oxml.ns import nsdecls, qn
+from docx.shared import Inches, Pt, RGBColor
+
+from app.config import settings
+from app.schemas import DocumentDraft, DocumentSection, TableData
+
+
+# Corporate Palette
+COLOR_PRIMARY_HEX = "1A365D"       # Deep Navy
+COLOR_SECONDARY_HEX = "2B6CB0"     # Slate Accent Blue
+COLOR_DARK_TEXT_HEX = "2D3748"     # Charcoal
+COLOR_LIGHT_BG_HEX = "F0F4F8"      # Light Cool Gray/Blue Tint
+COLOR_BORDER_HEX = "CBD5E0"        # Border Muted Gray
+
+RGB_PRIMARY = RGBColor(26, 54, 93)
+RGB_SECONDARY = RGBColor(43, 108, 176)
+RGB_DARK_TEXT = RGBColor(45, 55, 72)
+RGB_MUTED = RGBColor(113, 128, 150)
+
+
+def _set_cell_background(cell, hex_color: str):
+    """Sets background shading of a table cell."""
+    tc_pr = cell._tc.get_or_add_tcPr()
+    shd = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{hex_color}"/>')
+    tc_pr.append(shd)
+
+
+def _set_cell_margins(cell, top=140, bottom=140, left=180, right=180):
+    """Sets cell padding margins in twips (1 pt = 20 twips)."""
+    tc_pr = cell._tc.get_or_add_tcPr()
+    tc_mar = parse_xml(
+        f'<w:tcMar {nsdecls("w")}>'
+        f'  <w:top w:w="{top}" w:type="dxa"/>'
+        f'  <w:bottom w:w="{bottom}" w:type="dxa"/>'
+        f'  <w:left w:w="{left}" w:type="dxa"/>'
+        f'  <w:right w:w="{right}" w:type="dxa"/>'
+        f'</w:tcMar>'
+    )
+    tc_pr.append(tc_mar)
+
+
+def _set_callout_border(cell, hex_border_color=COLOR_PRIMARY_HEX):
+    """Adds a thick left accent border and clears others for callout boxes."""
+    tc_pr = cell._tc.get_or_add_tcPr()
+    borders = parse_xml(
+        f'<w:tcBorders {nsdecls("w")}>'
+        f'  <w:top w:val="none"/>'
+        f'  <w:left w:val="single" w:sz="36" w:space="0" w:color="{hex_border_color}"/>'
+        f'  <w:bottom w:val="none"/>'
+        f'  <w:right w:val="none"/>'
+        f'</w:tcBorders>'
+    )
+    tc_pr.append(borders)
+
+
+def _set_table_borders(table, hex_border_color=COLOR_BORDER_HEX):
+    """Applies subtle borders to a table."""
+    tbl_pr = table._tbl.tblPr
+    borders = parse_xml(
+        f'<w:tblBorders {nsdecls("w")}>'
+        f'  <w:top w:val="single" w:sz="4" w:space="0" w:color="{hex_border_color}"/>'
+        f'  <w:bottom w:val="single" w:sz="8" w:space="0" w:color="{COLOR_PRIMARY_HEX}"/>'
+        f'  <w:insideH w:val="single" w:sz="4" w:space="0" w:color="{hex_border_color}"/>'
+        f'  <w:insideV w:val="none"/>'
+        f'  <w:left w:val="none"/>'
+        f'  <w:right w:val="none"/>'
+        f'</w:tblBorders>'
+    )
+    tbl_pr.append(borders)
+
+
+class DocxGenerator:
+    """Generates styled, executive-grade Microsoft Word (.docx) documents."""
+
+    def __init__(self, output_dir: Optional[str] = None):
+        self.output_dir = output_dir or settings.OUTPUT_DIR
+        os.makedirs(self.output_dir, exist_ok=True)
+
+    def create_document(self, draft: DocumentDraft, filename: Optional[str] = None) -> str:
+        """
+        Builds a styled Word document from DocumentDraft and saves it.
+        Returns the absolute file path.
+        """
+        doc = Document()
+
+        # 1. Page Margins (1 inch all around)
+        for section in doc.sections:
+            section.top_margin = Inches(1.0)
+            section.bottom_margin = Inches(1.0)
+            section.left_margin = Inches(1.0)
+            section.right_margin = Inches(1.0)
+
+            # Header & Footer
+            header = section.header
+            header_para = header.paragraphs[0]
+            header_para.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+            hrun = header_para.add_run(f"{draft.title} | {draft.document_type}")
+            hrun.font.name = "Calibri"
+            hrun.font.size = Pt(8.5)
+            hrun.font.color.rgb = RGB_MUTED
+
+            footer = section.footer
+            footer_para = footer.paragraphs[0]
+            footer_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            frun = footer_para.add_run("CONFIDENTIAL & PROPRIETARY — AUTONOMOUS AI AGENT SYSTEM DELIVERABLE")
+            frun.font.name = "Calibri"
+            frun.font.size = Pt(8.0)
+            frun.font.color.rgb = RGB_MUTED
+
+        # 2. Document Title
+        title_para = doc.add_paragraph()
+        title_para.paragraph_format.space_before = Pt(0)
+        title_para.paragraph_format.space_after = Pt(4)
+        run_title = title_para.add_run(draft.title)
+        run_title.font.name = "Arial"
+        run_title.font.size = Pt(24)
+        run_title.font.bold = True
+        run_title.font.color.rgb = RGB_PRIMARY
+
+        # 3. Subtitle / Document Type
+        sub_para = doc.add_paragraph()
+        sub_para.paragraph_format.space_before = Pt(0)
+        sub_para.paragraph_format.space_after = Pt(16)
+        sub_text = draft.subtitle or f"Type: {draft.document_type} | Generated by Autonomous Agent"
+        run_sub = sub_para.add_run(sub_text)
+        run_sub.font.name = "Calibri"
+        run_sub.font.size = Pt(13)
+        run_sub.font.color.rgb = RGB_SECONDARY
+
+        # 4. Document Metadata Card
+        meta_table = doc.add_table(rows=2, cols=3)
+        meta_table.alignment = WD_TABLE_ALIGNMENT.CENTER
+        _set_table_borders(meta_table)
+
+        metadata_items = [
+            ("Document Type", draft.document_type),
+            ("Date", datetime.datetime.now().strftime("%B %d, %Y")),
+            ("Version", draft.metadata.get("Version", "1.0 Final")),
+            ("Author", draft.metadata.get("Author", "Autonomous Strategic Agent")),
+            ("Status", draft.metadata.get("Status", "Approved for Review")),
+            ("Classification", "Enterprise Business Record")
+        ]
+
+        idx = 0
+        for r in range(2):
+            for c in range(3):
+                cell = meta_table.cell(r, c)
+                _set_cell_background(cell, COLOR_LIGHT_BG_HEX)
+                _set_cell_margins(cell, top=100, bottom=100, left=140, right=140)
+                label, val = metadata_items[idx]
+                p = cell.paragraphs[0]
+                p.paragraph_format.space_after = Pt(2)
+                p.paragraph_format.space_before = Pt(0)
+                lbl_run = p.add_run(f"{label}: ")
+                lbl_run.font.bold = True
+                lbl_run.font.size = Pt(9.0)
+                lbl_run.font.color.rgb = RGB_PRIMARY
+                val_run = p.add_run(val)
+                val_run.font.size = Pt(9.0)
+                val_run.font.color.rgb = RGB_DARK_TEXT
+                idx += 1
+
+        doc.add_paragraph().paragraph_format.space_after = Pt(12)
+
+        # 5. Executive Summary (Highlight Box)
+        if draft.executive_summary:
+            exec_h = doc.add_paragraph()
+            exec_h.paragraph_format.space_before = Pt(14)
+            exec_h.paragraph_format.space_after = Pt(6)
+            run_eh = exec_h.add_run("Executive Summary")
+            run_eh.font.name = "Arial"
+            run_eh.font.size = Pt(15)
+            run_eh.font.bold = True
+            run_eh.font.color.rgb = RGB_PRIMARY
+
+            self._add_callout_box(doc, draft.executive_summary, title="Key Mandate & Executive Overview")
+
+        # 6. Render Sections
+        for section in draft.sections:
+            self._render_section(doc, section)
+
+        # 7. Save file
+        if not filename:
+            clean_title = re.sub(r'[^a-zA-Z0-9_\-]', '_', draft.title.lower())[:40]
+            filename = f"{clean_title}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
+        
+        if not filename.endswith(".docx"):
+            filename += ".docx"
+
+        file_path = os.path.join(self.output_dir, filename)
+        doc.save(file_path)
+        return str(Path(file_path).resolve())
+
+    def _render_section(self, doc: Document, section: DocumentSection):
+        """Renders an individual document section."""
+        # Heading
+        head_p = doc.add_paragraph()
+        head_p.paragraph_format.space_before = Pt(16)
+        head_p.paragraph_format.space_after = Pt(6)
+        head_p.paragraph_format.keep_with_next = True
+
+        h_run = head_p.add_run(section.title)
+        h_run.font.name = "Arial"
+        h_run.font.bold = True
+
+        if section.level == 1:
+            h_run.font.size = Pt(14.5)
+            h_run.font.color.rgb = RGB_PRIMARY
+        elif section.level == 2:
+            h_run.font.size = Pt(12.5)
+            h_run.font.color.rgb = RGB_SECONDARY
+        else:
+            h_run.font.size = Pt(11.0)
+            h_run.font.color.rgb = RGB_DARK_TEXT
+
+        # Narrative Content
+        if section.content:
+            p = doc.add_paragraph()
+            p.paragraph_format.space_before = Pt(2)
+            p.paragraph_format.space_after = Pt(8)
+            p.paragraph_format.line_spacing = 1.15
+            run = p.add_run(section.content)
+            run.font.name = "Calibri"
+            run.font.size = Pt(10.5)
+            run.font.color.rgb = RGB_DARK_TEXT
+
+        # Bullet Points
+        if section.bullet_points:
+            for bp in section.bullet_points:
+                bp_para = doc.add_paragraph(style='List Bullet')
+                bp_para.paragraph_format.space_before = Pt(1)
+                bp_para.paragraph_format.space_after = Pt(3)
+                bp_para.paragraph_format.line_spacing = 1.15
+                run = bp_para.add_run(bp)
+                run.font.name = "Calibri"
+                run.font.size = Pt(10.0)
+                run.font.color.rgb = RGB_DARK_TEXT
+
+        # Table
+        if section.table and section.table.headers and section.table.rows:
+            self._render_table(doc, section.table)
+
+        # Callout Box
+        if section.callout_box:
+            self._add_callout_box(doc, section.callout_box, title="Strategic Note")
+
+    def _render_table(self, doc: Document, table_data: TableData):
+        """Builds a formatted table with headers and alternating row shading."""
+        num_rows = len(table_data.rows) + 1
+        num_cols = len(table_data.headers)
+
+        table = doc.add_table(rows=num_rows, cols=num_cols)
+        table.alignment = WD_TABLE_ALIGNMENT.CENTER
+        _set_table_borders(table)
+
+        # Header Row
+        header_cells = table.rows[0].cells
+        for col_idx, header_text in enumerate(table_data.headers):
+            cell = header_cells[col_idx]
+            _set_cell_background(cell, COLOR_PRIMARY_HEX)
+            _set_cell_margins(cell, top=140, bottom=140, left=140, right=140)
+            p = cell.paragraphs[0]
+            p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            p.paragraph_format.space_before = Pt(0)
+            p.paragraph_format.space_after = Pt(0)
+            run = p.add_run(header_text)
+            run.font.name = "Arial"
+            run.font.bold = True
+            run.font.size = Pt(9.5)
+            run.font.color.rgb = RGBColor(255, 255, 255)
+
+        # Data Rows
+        for r_idx, row_values in enumerate(table_data.rows):
+            row_cells = table.rows[r_idx + 1].cells
+            bg_color = COLOR_LIGHT_BG_HEX if r_idx % 2 == 1 else "FFFFFF"
+            for c_idx in range(num_cols):
+                cell = row_cells[c_idx]
+                _set_cell_background(cell, bg_color)
+                _set_cell_margins(cell, top=100, bottom=100, left=120, right=120)
+                val = row_values[c_idx] if c_idx < len(row_values) else ""
+                p = cell.paragraphs[0]
+                p.paragraph_format.space_before = Pt(0)
+                p.paragraph_format.space_after = Pt(0)
+                run = p.add_run(str(val))
+                run.font.name = "Calibri"
+                run.font.size = Pt(9.5)
+                run.font.color.rgb = RGB_DARK_TEXT
+
+        doc.add_paragraph().paragraph_format.space_after = Pt(8)
+
+    def _add_callout_box(self, doc: Document, text: str, title: Optional[str] = None):
+        """Creates an executive callout box with a shaded background and thick left border."""
+        tbl = doc.add_table(rows=1, cols=1)
+        tbl.alignment = WD_TABLE_ALIGNMENT.CENTER
+        cell = tbl.cell(0, 0)
+        _set_cell_background(cell, COLOR_LIGHT_BG_HEX)
+        _set_callout_border(cell, COLOR_PRIMARY_HEX)
+        _set_cell_margins(cell, top=140, bottom=140, left=200, right=160)
+
+        p = cell.paragraphs[0]
+        p.paragraph_format.space_before = Pt(0)
+        p.paragraph_format.space_after = Pt(2)
+        p.paragraph_format.line_spacing = 1.15
+
+        if title:
+            trun = p.add_run(f"■ {title}\n")
+            trun.font.name = "Arial"
+            trun.font.bold = True
+            trun.font.size = Pt(10.0)
+            trun.font.color.rgb = RGB_PRIMARY
+
+        run = p.add_run(text)
+        run.font.name = "Calibri"
+        run.font.italic = True
+        run.font.size = Pt(10.0)
+        run.font.color.rgb = RGB_DARK_TEXT
+
+        doc.add_paragraph().paragraph_format.space_after = Pt(8)
+
+
+docx_generator = DocxGenerator()
